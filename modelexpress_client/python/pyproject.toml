@@ -41,6 +41,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
+otel = [
+    "opentelemetry-api>=1.20.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ai-dynamo/modelexpress"
@@ -56,3 +59,9 @@ include = ["modelexpress*"]
 
 [tool.setuptools.package-data]
 modelexpress = ["py.typed"]
+
+[dependency-groups]
+dev = [
+    "opentelemetry-api>=1.41.1",
+    "opentelemetry-sdk>=1.41.1",
+]
