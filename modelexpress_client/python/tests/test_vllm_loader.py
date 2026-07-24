@@ -1804,3 +1804,80 @@ class TestConfigureVllmLogging:
             assert mx_root.level == logging.DEBUG
         finally:
             self._cleanup(vllm_logger)
+
+
+# ---------------------------------------------------------------------------
+# Compilation-state preservation across re-init (MTP target/drafter sharing)
+# ---------------------------------------------------------------------------
+
+
+def _make_adapter_with_compilation_config(compilation_config):
+    """Build a VllmAdapter without running __init__ (which touches devices)."""
+    from types import SimpleNamespace
+    from collections import Counter  # noqa: F401  (kept for reader clarity)
+    from modelexpress.engines.vllm.adapter import VllmAdapter
+
+    adapter = object.__new__(VllmAdapter)
+    adapter.vllm_config = SimpleNamespace(compilation_config=compilation_config)
+    return adapter
+
+
+def _make_compilation_config():
+    from types import SimpleNamespace
+    from collections import Counter
+
+    return SimpleNamespace(
+        static_forward_context={},
+        static_all_moe_layers=[],
+        enabled_custom_ops=Counter(),
+        disabled_custom_ops=Counter(),
+        traced_files=set(),
+        compilation_time=0.0,
+    )
+
+
+def test_reinit_preserves_target_registrations_when_drafter_reinits():
+    """MTP: the drafter's re-init must not drop the already-loaded target's layers."""
+    cc = _make_compilation_config()
+    target_layer = object()
+    cc.static_forward_context["language_model.model.layers.0.linear_attn"] = target_layer
+    cc.static_all_moe_layers.append("language_model.model.layers.0.mlp")
+    cc.enabled_custom_ops["rms_norm"] += 1
+    cc.traced_files.add("/target/file.py")
+
+    adapter = _make_adapter_with_compilation_config(cc)
+
+    # Simulate reinit_for_retry's body: snapshot -> reset -> (initialize_model
+    # registers ONLY the drafter's layers) -> restore.
+    preserved = adapter._snapshot_compilation_state()
+    adapter._reset_compilation_state()
+    assert cc.static_forward_context == {}  # blanket clear happened
+    draft_layer = object()
+    cc.static_forward_context["mtp.layers.0.linear_attn"] = draft_layer
+    cc.static_all_moe_layers.append("mtp.layers.0.mlp")
+    adapter._restore_compilation_state(preserved)
+
+    # Target survives with identity intact; drafter is present too.
+    assert cc.static_forward_context["language_model.model.layers.0.linear_attn"] is target_layer
+    assert cc.static_forward_context["mtp.layers.0.linear_attn"] is draft_layer
+    assert "language_model.model.layers.0.mlp" in cc.static_all_moe_layers
+    assert "mtp.layers.0.mlp" in cc.static_all_moe_layers
+    assert cc.enabled_custom_ops["rms_norm"] == 1
+    assert "/target/file.py" in cc.traced_files
+
+
+def test_reinit_keeps_freshly_reinitialized_layer_object():
+    """Single-model retry: restore must not clobber the freshly built module."""
+    cc = _make_compilation_config()
+    stale_layer = object()
+    cc.static_forward_context["language_model.model.layers.0.linear_attn"] = stale_layer
+
+    adapter = _make_adapter_with_compilation_config(cc)
+
+    preserved = adapter._snapshot_compilation_state()
+    adapter._reset_compilation_state()
+    fresh_layer = object()
+    cc.static_forward_context["language_model.model.layers.0.linear_attn"] = fresh_layer
+    adapter._restore_compilation_state(preserved)
+
+    assert cc.static_forward_context["language_model.model.layers.0.linear_attn"] is fresh_layer

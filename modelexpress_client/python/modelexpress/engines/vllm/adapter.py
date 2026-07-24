@@ -39,6 +39,17 @@ _DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
 
 _SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 
+# Per-layer registries vLLM populates on the (shared) compilation_config during
+# initialize_model(). Under MTP the target and drafter share one config, so these
+# are snapshotted/restored across re-init rather than blindly cleared.
+_COMPILATION_STATE_COLLECTIONS: tuple[str, ...] = (
+    "static_forward_context",
+    "static_all_moe_layers",
+    "enabled_custom_ops",
+    "disabled_custom_ops",
+    "traced_files",
+)
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -287,6 +298,9 @@ class VllmAdapter(EngineAdapter):
         result.model = None
         del old_value
         self.accelerator_backend.empty_cache()
+        # Preserve entries owned by an already-loaded model (the MTP target)
+        # across the reset instead of dropping them.
+        preserved = self._snapshot_compilation_state()
         self._reset_compilation_state()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",
@@ -297,6 +311,7 @@ class VllmAdapter(EngineAdapter):
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
             )
+        self._restore_compilation_state(preserved)
         return LoadResult(value=model, model=model, publishable=result.publishable)
 
     def _process_weights_after_loading(
@@ -364,20 +379,48 @@ class VllmAdapter(EngineAdapter):
         return torch.device(load_device)
 
     def _reset_compilation_state(self) -> None:
+        # Clear the shared registries so re-init doesn't trip duplicate
+        # registration; snapshot/restore around this preserves co-owned entries.
         compilation_config = self.vllm_config.compilation_config
-        # vLLM registers each attention / MLA / Mamba / FusedMoE layer into
-        # fields on vllm_config.compilation_config during initialize_model().
-        # Those fields live on the config object, not the model, so they survive
-        # del model and trip duplicate registration on the next initialize_model().
-        # Clear them so re-init starts from a clean slate. Audited against vLLM
-        # 0.17.1; other versions may add init=False fields that need similar
-        # treatment.
-        compilation_config.static_forward_context.clear()
-        compilation_config.static_all_moe_layers.clear()
-        compilation_config.enabled_custom_ops.clear()
-        compilation_config.disabled_custom_ops.clear()
-        compilation_config.traced_files.clear()
+        for attr in _COMPILATION_STATE_COLLECTIONS:
+            collection = getattr(compilation_config, attr, None)
+            if collection is not None:
+                collection.clear()
         compilation_config.compilation_time = 0.0
+
+    def _snapshot_compilation_state(self) -> dict:
+        """Shallow-copy the per-layer compilation registries before a reset."""
+        compilation_config = self.vllm_config.compilation_config
+        snapshot: dict = {}
+        for attr in _COMPILATION_STATE_COLLECTIONS:
+            collection = getattr(compilation_config, attr, None)
+            if collection is not None:
+                snapshot[attr] = collection.copy()
+        return snapshot
+
+    def _restore_compilation_state(self, snapshot: dict) -> None:
+        """Re-add snapshotted entries the fresh initialize_model() did not recreate.
+
+        Entries the new model registered are kept as-is; only missing ones (the
+        co-owned MTP target's) are restored, without clobbering the fresh model's.
+
+        Args:
+            snapshot: Mapping produced by `_snapshot_compilation_state`.
+        """
+        compilation_config = self.vllm_config.compilation_config
+        for attr, saved in snapshot.items():
+            collection = getattr(compilation_config, attr, None)
+            if collection is None:
+                continue
+            if isinstance(collection, dict):
+                for key, value in saved.items():
+                    collection.setdefault(key, value)
+            elif isinstance(collection, set):
+                collection.update(saved)
+            else:
+                for item in saved:
+                    if item not in collection:
+                        collection.append(item)
 
     def _model_streamer_distributed_enabled(self) -> bool:
         tp_size = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
